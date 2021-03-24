@@ -1,0 +1,140 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tunnel-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+rules:
+  - apiGroups:
+      - "networking.k8s.io"
+    resources:
+      - 'ingresses'
+    verbs:
+      - '*'
+  - apiGroups:
+      - "cert-manager.io"
+    resources:
+      - 'certificates'
+    verbs:
+      - '*'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tunnelware
+subjects:
+  - kind: ServiceAccount
+    name: tunnelware
+    namespace: tunnel-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+spec:
+  selector:
+    app: tunnelware
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tunnelware
+  template:
+    metadata:
+      labels:
+        app: tunnelware
+    spec:
+      serviceAccountName: tunnelware
+      containers:
+        - name: tunnelware
+          image: strongmonkey1992/tunnelware:dev
+          imagePullPolicy: Always
+          args:
+            - tunnelware
+            - server
+            - --listen
+            - ":8080"
+            - --debug
+          ports:
+          - containerPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - "tunnelware.do.rancher.space"
+      secretName: tunnelware-tls
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tunnelware
+                port:
+                  number: 80
+      host: "tunnelware.do.rancher.space"
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-production
+  namespace: tunnel-system
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: daishan.peng@suse.com
+    privateKeySecretRef:
+      name: tunnelware-account
+    solvers:
+      - selector: {}
+        http01:
+          ingress:
+            class: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tunnelware
+  namespace: tunnel-system
+spec:
+  secretName: tunnelware-tls
+  issuerRef:
+    name: letsencrypt-production
+  commonName: tunnelware.do.rancher.space
+  dnsNames:
+  - tunnelware.do.rancher.space
+
