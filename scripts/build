@@ -11,7 +11,7 @@ if [ "$(uname)" = "Linux" ]; then
 fi
 LINKFLAGS="-X github.com/rancher/tunnelware.Version=$VERSION"
 LINKFLAGS="-X github.com/rancher/tunnelware.GitCommit=$COMMIT $LINKFLAGS"
-CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o bin/tunnelware
+CGO_ENABLED=0 go build -ldflags "$LINKFLAGS $OTHER_LINKFLAGS" -o biN/tunnelware
 if [ "$CROSS" = "true" ] && [ "$ARCH" = "amd64" ]; then
     GOOS=darwin go build -ldflags "$LINKFLAGS" -o bin/tunnelware-darwin
     GOOS=windows go build -ldflags "$LINKFLAGS" -o bin/tunnelware-windows

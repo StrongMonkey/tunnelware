@@ -5,45 +5,6 @@ metadata:
   name: tunnel-system
 ---
 apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: tunnelware
-  namespace: tunnel-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: tunnelware
-  namespace: tunnel-system
-rules:
-  - apiGroups:
-      - "networking.k8s.io"
-    resources:
-      - 'ingresses'
-    verbs:
-      - '*'
-  - apiGroups:
-      - "cert-manager.io"
-    resources:
-      - 'certificates'
-    verbs:
-      - '*'
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: tunnelware
-  namespace: tunnel-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: tunnelware
-subjects:
-  - kind: ServiceAccount
-    name: tunnelware
-    namespace: tunnel-system
----
-apiVersion: v1
 kind: Service
 metadata:
   name: tunnelware
@@ -71,7 +32,6 @@ spec:
       labels:
         app: tunnelware
     spec:
-      serviceAccountName: tunnelware
       containers:
         - name: tunnelware
           image: strongmonkey1992/tunnelware:dev
@@ -84,6 +44,29 @@ spec:
             - --debug
           ports:
           - containerPort: 8080
+          env:
+            - name: GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-client-secret
+                  key: github-client-id
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: github-client-secret
+                  key: github-client-secret
+            - name: JWT_SECRET_KEY_PATH
+              value: "/etc/jwt/private-key"
+            - name: SERVER_ADDRESS
+              value: "https://tunnelware.do.rancher.space"
+          volumeMounts:
+            - name: jwt-secret
+              mountPath: "/etc/jwt"
+              readOnly: true
+      volumes:
+        - name: jwt-secret
+          secret:
+            secretName: jwt-private-key
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -94,9 +77,20 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
+        - "*.tunnelware.do.rancher.space"
         - "tunnelware.do.rancher.space"
       secretName: tunnelware-tls
   rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tunnelware
+                port:
+                  number: 80
+      host: "*.tunnelware.do.rancher.space"
     - http:
         paths:
           - path: /
@@ -120,10 +114,11 @@ spec:
     privateKeySecretRef:
       name: tunnelware-account
     solvers:
-      - selector: {}
-        http01:
-          ingress:
-            class: traefik
+      - dns01:
+          digitalocean:
+            tokenSecretRef:
+              name: digitalocean-dns
+              key: access-token
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -134,7 +129,8 @@ spec:
   secretName: tunnelware-tls
   issuerRef:
     name: letsencrypt-production
-  commonName: tunnelware.do.rancher.space
+  commonName: "*.tunnelware.do.rancher.space"
   dnsNames:
-  - tunnelware.do.rancher.space
+  - "*.tunnelware.do.rancher.space"
+  - "tunnelware.do.rancher.space"
 

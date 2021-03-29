@@ -2,33 +2,30 @@ package cmd
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	url2 "net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	badger "github.com/dgraph-io/badger/v3"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/google/go-github/v34/github"
 	"github.com/gorilla/mux"
-	certmanagerv1 "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
-	cmmeta "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
 	"github.com/pkg/errors"
 	"github.com/rancher/remotedialer"
 	cli "github.com/rancher/wrangler-cli"
-	"github.com/rancher/wrangler/pkg/apply"
-	"github.com/rancher/wrangler/pkg/kubeconfig"
+	"github.com/rancher/wrangler/pkg/kv"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	networkingv1 "k8s.io/api/networking/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-)
-
-var (
-	namespace = "tunnel-system"
+	"golang.org/x/oauth2"
 )
 
 func NewServerCommand() *cobra.Command {
@@ -39,23 +36,45 @@ func NewServerCommand() *cobra.Command {
 }
 
 type Server struct {
-	Listen     string `name:"listen" usage:"Listen address" default:":8123"`
-	ID         string `name:"id" usage:"Peer ID"`
-	Token      string `name:"token" usage:"Peer Token"`
-	Peers      string `name:"peers" usage:"Peers format id:token:url,id:token:url"`
-	Debug      bool   `name:"debug" usage:"Enable debug logging"`
-	Kubeconfig string `name:"kubeconfig" usage:"Path to kubeconfig"`
+	Listen string `name:"listen" usage:"Listen address" default:":8123"`
+	ID     string `name:"id" usage:"Peer ID"`
+	Token  string `name:"token" usage:"Peer Token"`
+	Peers  string `name:"peers" usage:"Peers format id:token:url,id:token:url"`
+	Debug  bool   `name:"debug" usage:"Enable debug logging"`
 }
 
 var (
-	clients = map[string]*http.Client{}
-	l       sync.Mutex
-	counter int64
+	clients       = map[string]*http.Client{}
+	hostMap       = map[string]string{}
+	jwtTokenMap   = map[string]string{}
+	l             sync.Mutex
+	counter       int64
+	jwtPrivateKey *ecdsa.PrivateKey
 )
 
 func authorizer(req *http.Request) (string, bool, error) {
-	id := req.Header.Get("x-tunnel-id")
-	return id, id != "", nil
+	username, forwardPort := kv.Split(req.Header.Get("x-tunnel-id"), ":")
+	if username == "" || forwardPort == "" {
+		return "", false, nil
+	}
+	if username == "" {
+		return "", false, nil
+	}
+
+	jwtToken := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+	claim := &Claim{}
+	_, err := jwt.ParseWithClaims(jwtToken, claim, func(token *jwt.Token) (interface{}, error) {
+		return &jwtPrivateKey.PublicKey, nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	if !strings.EqualFold(claim.Username, username) {
+		return "", false, fmt.Errorf("not able to establish tunnel using username %v. Not enough permission", username)
+	}
+	hostMap[username] = forwardPort
+	return username, true, nil
 }
 
 func client(server *Handler, rw http.ResponseWriter, req *http.Request) {
@@ -64,27 +83,16 @@ func client(server *Handler, rw http.ResponseWriter, req *http.Request) {
 		timeout = "15"
 	}
 
-	host := req.Host
-	clientKey := strings.Split(host, ".")[0]
-	path := req.URL.Path
-	var dialerHost string
-	server.db.View(func(txn *badger.Txn) error {
-		val, err := txn.Get([]byte(strings.Split(host, ":")[0]))
-		if err != nil {
-			return err
-		}
-		return val.Value(func(val []byte) error {
-			dialerHost = string(val)
-			return nil
-		})
-	})
+	username := strings.Split(strings.Split(req.Host, ":")[0], ".")[0]
+	forwardHost := hostMap[username]
+	clientKey := username
 
-	if dialerHost == "" {
+	if forwardHost == "" {
 		remotedialer.DefaultErrorWriter(rw, req, 500, errors.New("no tunnel found"))
 		return
 	}
 
-	u, err := url2.Parse(dialerHost)
+	u, err := url2.Parse(forwardHost)
 	if err != nil {
 		remotedialer.DefaultErrorWriter(rw, req, 500, err)
 		return
@@ -97,7 +105,6 @@ func client(server *Handler, rw http.ResponseWriter, req *http.Request) {
 	request.RequestURI = ""
 	request.URL.Scheme = u.Scheme
 	request.URL.Host = u.Host
-	request.URL.Path = path
 	logrus.Infof("[%03d] REQ t=%s %s", id, timeout, request.URL.String())
 
 	if req.TLS != nil && u.Scheme == "http" {
@@ -154,26 +161,20 @@ func (s *Server) Run(cmd *cobra.Command, args []string) error {
 		remotedialer.PrintTunnelData = true
 	}
 
-	cfg := kubeconfig.GetInteractiveClientConfig(s.Kubeconfig)
-	restConfig, err := cfg.ClientConfig()
+	secretPath := os.Getenv("JWT_SECRET_KEY_PATH")
+	secret, err := ioutil.ReadFile(secretPath)
 	if err != nil {
-		return err
-	}
-	apply, err := apply.NewForConfig(restConfig)
-	if err != nil {
-		return err
+		panic(err)
 	}
 
-	db, err := badger.Open(badger.DefaultOptions("/tmp/badger"))
+	privateKey, err := jwt.ParseECPrivateKeyFromPEM(secret)
 	if err != nil {
-		logrus.Fatal(err)
+		panic(err)
 	}
-	defer db.Close()
+	jwtPrivateKey = privateKey
 
 	handler := &Handler{
 		Server: remotedialer.New(authorizer, remotedialer.DefaultErrorWriter),
-		db:     db,
-		apply:  apply.WithDynamicLookup().WithListerNamespace(namespace),
 	}
 	handler.PeerToken = s.Token
 	handler.PeerID = s.ID
@@ -187,7 +188,10 @@ func (s *Server) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	router := mux.NewRouter()
-	router.Handle("/connect", handler)
+	router.HandleFunc("/connect", handler.onConnect)
+	router.HandleFunc("/login/github", handler.githubLogin)
+	router.HandleFunc("/github/callback", handler.githubLoginCallback)
+	router.HandleFunc("/jwt/{state}", handler.jwtToken)
 	router.PathPrefix("/").HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		client(handler, rw, req)
 	})
@@ -202,101 +206,107 @@ func (s *Server) Run(cmd *cobra.Command, args []string) error {
 
 type Handler struct {
 	*remotedialer.Server
-	db    *badger.DB
-	apply apply.Apply
 }
 
-func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	fqdn := req.URL.Query().Get("fqdn")
-	if fqdn == "" {
-		remotedialer.DefaultErrorWriter(rw, req, 422, errors.New("no fqdn is provided"))
-		return
-	}
-
-	forwardAddress := req.URL.Query().Get("forward")
-	if forwardAddress == "" {
-		remotedialer.DefaultErrorWriter(rw, req, 422, errors.New("no forward address is provided"))
-		return
-	}
-
-	if err := h.db.Update(func(txn *badger.Txn) error {
-		logrus.Debugf("setting %v to %v", fqdn, forwardAddress)
-		return txn.Set([]byte(fqdn), []byte(forwardAddress))
-	}); err != nil {
-		remotedialer.DefaultErrorWriter(rw, req, 500, err)
-		return
-	}
-	if err := h.createIngressAndCertificates(fqdn); err != nil {
-		remotedialer.DefaultErrorWriter(rw, req, 500, err)
-		return
-	}
-	defer func() {
-		if err := h.deleteIngressAndCertificates(fqdn); err != nil {
-			logrus.Error(err)
-		}
-	}()
-
+func (h *Handler) onConnect(rw http.ResponseWriter, req *http.Request) {
 	h.Server.ServeHTTP(rw, req)
 }
 
-func (h *Handler) createIngressAndCertificates(hostname string) error {
-	prefix := networkingv1.PathTypePrefix
-	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      hostname,
-			Namespace: namespace,
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: hostname,
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: &prefix,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: "tunnelware",
-											Port: networkingv1.ServiceBackendPort{
-												Number: 80,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			TLS: []networkingv1.IngressTLS{
-				{
-					Hosts:      []string{hostname},
-					SecretName: fmt.Sprintf("%s-tls", hostname),
-				},
-			},
-		},
-	}
-	certificate := &certmanagerv1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      hostname,
-			Namespace: namespace,
-		},
-		Spec: certmanagerv1.CertificateSpec{
-			SecretName: fmt.Sprintf("%s-tls", hostname),
-			IssuerRef: cmmeta.ObjectReference{
-				Name: "letsencrypt-production",
-			},
-			CommonName: hostname,
-			DNSNames:   []string{hostname},
-		},
-	}
-	clientKey := strings.Split(hostname, ".")[0]
-	return h.apply.WithSetID(clientKey).ApplyObjects(ingress, certificate)
+func (h *Handler) githubLogin(rw http.ResponseWriter, req *http.Request) {
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	state := req.URL.Query().Get("state")
+
+	redirectURL := fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=read:user&state=%s", clientID, fmt.Sprintf("%s/github/callback", os.Getenv("SERVER_ADDRESS")), state)
+	http.Redirect(rw, req, redirectURL, 301)
 }
 
-func (h *Handler) deleteIngressAndCertificates(hostname string) error {
-	clientKey := strings.Split(hostname, ".")[0]
-	return h.apply.WithSetID(clientKey).Apply(nil)
+type response struct {
+	AccessToken string `json:"access_token"`
+}
+
+func (h *Handler) githubLoginCallback(rw http.ResponseWriter, req *http.Request) {
+	code := req.URL.Query().Get("code")
+	state := req.URL.Query().Get("state")
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	clientSecret := os.Getenv("GITHUB_CLIENT_SECRET")
+
+	request, err := http.NewRequest("POST", "https://github.com/login/oauth/access_token", nil)
+	if err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+	query := request.URL.Query()
+	query.Add("client_id", clientID)
+	query.Add("client_secret", clientSecret)
+	query.Add("code", code)
+	query.Add("state", state)
+	request.URL.RawQuery = query.Encode()
+	request.Header.Set("Accept", "application/json")
+	fmt.Println(request.URL.String())
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+
+	defer resp.Body.Close()
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		remotedialer.DefaultErrorWriter(rw, req, 500, errors.New(string(respData)))
+		return
+	}
+	githubResp := &response{}
+	if err := json.Unmarshal(respData, githubResp); err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: githubResp.AccessToken},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	githubClient := github.NewClient(tc)
+	user, _, err := githubClient.Users.Get(ctx, "")
+	if err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+
+	if user.Login == nil || *user.Login == "" {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+
+	claim := Claim{
+		Username: *user.Login,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour * 24 * 365).Unix(),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES512, claim)
+	tokenString, err := token.SignedString(jwtPrivateKey)
+	if err != nil {
+		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		return
+	}
+	jwtTokenMap[state] = tokenString
+	rw.Write([]byte("Login successfully. Please go back to your terminal and continue"))
+	rw.WriteHeader(200)
+	return
+}
+
+func (h *Handler) jwtToken(rw http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	state := vars["state"]
+	jwtToken := jwtTokenMap[state]
+	defer delete(jwtTokenMap, state)
+
+	rw.Write([]byte(jwtToken))
+	rw.WriteHeader(200)
 }
