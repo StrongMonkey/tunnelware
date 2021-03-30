@@ -305,8 +305,12 @@ func (h *Handler) jwtToken(rw http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	state := vars["state"]
 	jwtToken := jwtTokenMap[state]
-	defer delete(jwtTokenMap, state)
+	if jwtToken == "" {
+		rw.WriteHeader(503)
+		return
+	}
 
+	defer delete(jwtTokenMap, state)
 	rw.Write([]byte(jwtToken))
 	rw.WriteHeader(200)
 }

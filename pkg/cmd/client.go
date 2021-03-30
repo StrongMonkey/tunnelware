@@ -9,12 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/pkg/browser"
 	"github.com/pkg/errors"
 	"github.com/rancher/remotedialer"
-	"github.com/rancher/tunnelware/pkg/questions"
 	cli "github.com/rancher/wrangler-cli"
 	"github.com/rancher/wrangler/pkg/randomtoken"
 	"github.com/sirupsen/logrus"
@@ -88,24 +88,24 @@ func (c *Client) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		finished, err := questions.PromptBool("Once you finish github login, enter y to continue", true)
-		if err != nil {
-			return err
-		}
-		if !finished {
-			return nil
-		}
-		resp, err := http.Get(fmt.Sprintf("https://%s/jwt/%s", serverURL.Host, state))
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		token, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		if err := ioutil.WriteFile(tokenFile, token, 0755); err != nil {
-			return err
+		for {
+			resp, err := http.Get(fmt.Sprintf("https://%s/jwt/%s", serverURL.Host, state))
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == 503 {
+				continue
+			}
+			token, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
+			if err := ioutil.WriteFile(tokenFile, token, 0755); err != nil {
+				return err
+			}
+			break
 		}
 	}
 
@@ -142,7 +142,10 @@ func (c *Client) Run(cmd *cobra.Command, args []string) error {
 	domainWithUsername := fmt.Sprintf("%s.%s", strings.ToLower(claim.Username), domain)
 	go func() {
 		fmt.Printf("http://%v --------> %v\nhttps://%v -------> %v\n", domainWithUsername, forwardHost, domainWithUsername, forwardHost)
-		remotedialer.ClientConnect(cmd.Context(), u.String(), headers, nil, func(string, string) bool { return true }, nil)
+		for {
+			remotedialer.ClientConnect(cmd.Context(), u.String(), headers, nil, func(string, string) bool { return true }, nil)
+			time.Sleep(time.Second * 5)
+		}
 	}()
 	<-cmd.Context().Done()
 	return nil

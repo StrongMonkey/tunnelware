@@ -6,7 +6,6 @@ package main
 
 import (
 	"github.com/rancher/tunnelware/pkg/cmd"
-	_ "github.com/rancher/tunnelware/pkg/generated/controllers/cert-manager.io"
 	cli "github.com/rancher/wrangler-cli"
 	_ "github.com/rancher/wrangler/pkg/generated/controllers/networking.k8s.io"
 )
