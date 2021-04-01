@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asaskevich/govalidator"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/pkg/browser"
 	"github.com/pkg/errors"
@@ -127,7 +128,8 @@ func (c *Client) Run(cmd *cobra.Command, args []string) error {
 	}
 	scheme := args[0]
 	forwardHost := args[1]
-	if !strings.Contains(forwardHost, ":") {
+	// if only contains number, then use 127.0.0.1
+	if govalidator.IsNumeric(forwardHost) {
 		forwardHost = fmt.Sprintf("%v://127.0.0.1:%v", scheme, forwardHost)
 	} else {
 		forwardHost = fmt.Sprintf("%v://%v", scheme, forwardHost)
